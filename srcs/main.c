@@ -44,8 +44,8 @@
 
 #define HID_KEYBOARD_SCANCODE_ENTER 0x28
 
-#define BUTTON_PIN 3
-#define LED_PIN 7
+#define BUTTON_PIN 2
+#define LED_PIN 1
 
 #define DEBOUNCE_TIME 50
 
@@ -367,9 +367,8 @@ void usbctrl_handler(void)
 		usb_handle_setup_request(device);
 	}
 
-	if (status & USB_INTS_BUFF_STATUS_BITS) {
+	if (status & USB_INTS_BUFF_STATUS_BITS)
 		usb_handle_buffer_status(device);
-	}
 
 	if (status & USB_INTS_BUS_RESET_BITS) {
 		usb_hw_clear->sie_status = USB_SIE_STATUS_BUS_RESET_BITS;
@@ -762,11 +761,12 @@ int main(void)
 		.string_descriptor = &string_descriptor,
 		.descriptor_strings = {
 			// Vendor.
-			"Raspberry Pi",
+			"Alynx Zhou",
 			// Product.
 			"AZButton Pico",
 			// Serial Number.
-			"00000001"
+			// Actually it is a string, so just put anything I want.
+			"Strelizia"
 		},
 		.ep0_in = &ep0_in,
 		.ep0_out = &ep0_out,
