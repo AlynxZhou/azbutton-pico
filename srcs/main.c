@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdlib.h>
 
 // USB register definitions from pico-sdk.
 #include "hardware/regs/usb.h"
@@ -71,6 +72,19 @@ void led_init(void)
 	gpio_set_dir(LED_PIN, GPIO_OUT);
 }
 
+void usb_handle_device_suspend(struct usb_device *device)
+{
+	// Turn off the LED if device suspends.
+	led_off();
+}
+
+// void usb_handle_device_connect_disconnect(struct usb_device *device)
+// {
+// 	// If host disconnected, exit.
+// 	if (!(usb_hw->sie_status & USB_SIE_STATUS_CONNECTED_BITS))
+// 		exit(0);
+// }
+
 void usb_handle_bus_reset(struct usb_device *device)
 {
 	device->address = 0;
@@ -122,10 +136,9 @@ void usb_handle_buffer_status(struct usb_device *device)
 		for (int j = 0; j < interface->n_endpoints; ++j) {
 			struct usb_endpoint *endpoint = interface->endpoints[j];
 			if (buffers &
-			    (1 << usb_endpoint_address_to_bit(endpoint))) {
+			    (1 << usb_endpoint_address_to_bit(endpoint)))
 				usb_endpoint_handle_buffer_done(endpoint,
 								device);
-			}
 		}
 	}
 
@@ -140,9 +153,9 @@ void usb_endpoint_start_transfer(struct usb_endpoint *endpoint, uint8_t *buffer,
 	if (length > PACKET_SIZE)
 		length = PACKET_SIZE;
 
-	// We need to store buffer length in `buffer_control`, so we could get
-	// length in complete callback. The control flags use the second byte,
-	// and length uses the first byte, so they won't conflict.
+	// We store buffer length in `buffer_control`, so we could get length
+	// in complete callback. The control flags use the higher byte, and
+	// length uses the lower byte, so they won't conflict.
 	uint32_t value = length | USB_BUF_CTRL_AVAIL;
 
 	if (usb_endpoint_is_in(endpoint)) {
@@ -169,10 +182,10 @@ void usb_endpoint_ack(struct usb_endpoint *endpoint)
 void usb_set_address(struct usb_device *device,
 		     volatile struct usb_setup_packet *packet)
 {
+	// According to the standard, we are not assumed to change address
+	// immediately, we must to respond from address 0 first. So we delay it.
 	device->address = (packet->wValue & 0xff);
 	device->should_set_address = true;
-	// According to the standard, we are not assumed to change address
-	// immediately, we must to respond from address 0 first.
 }
 
 void usb_set_configuration(struct usb_device *device,
@@ -200,7 +213,7 @@ void usb_get_configuration_descriptor(struct usb_device *device,
 	       device->configuration_descriptor->bLength);
 	buffer += device->configuration_descriptor->bLength;
 
-	// According to USB specification, you should also provide interface
+	// According to USB specification, we should also provide interface
 	// descriptors, HID descriptors and endpoint descriptors along with
 	// configuration descriptors.
 	//
@@ -307,6 +320,9 @@ void usb_handle_setup_request(struct usb_device *device)
 	// See Control Transfer in <https://www.usbmadesimple.co.uk/ums_3.htm>.
 	//
 	// Control always starts from DATA1 so reset PID to 1 for EP0 IN.
+	//
+	// Control has 3 stage: SETUP, DATA and STATUS. In STATUS, we need to
+	// send ACK from the other endpoint.
 	device->ep0_in->next_pid = 1;
 
 	if (direction == USB_DIRECTION_OUT) {
@@ -320,12 +336,7 @@ void usb_handle_setup_request(struct usb_device *device)
 		default:
 			break;
 		}
-		// See Control Transfer in <https://www.usbmadesimple.co.uk/ums_3.htm>.
-		//
-		// Control has 3 stage: SETUP, DATA and STATUS. In STATUS, you
-		// need to send ACK from the other endpoint.
-		//
-		// So for OUT request, we use IN.
+		// So for OUT request, we use IN endpoint.
 		usb_endpoint_ack(device->ep0_in);
 	} else if (direction == USB_DIRECTION_IN) {
 		if (request == USB_REQUEST_GET_DESCRIPTOR) {
@@ -348,12 +359,7 @@ void usb_handle_setup_request(struct usb_device *device)
 				break;
 			}
 		}
-		// See Control Transfer in <https://www.usbmadesimple.co.uk/ums_3.htm>.
-		//
-		// Control has 3 stage: SETUP, DATA and STATUS. In STATUS, you
-		// need to send ACK from the other endpoint.
-		//
-		// So for IN request, we use OUT.
+		// So for IN request, we use OUT endpoint.
 		usb_endpoint_ack(device->ep0_out);
 	}
 }
@@ -367,12 +373,36 @@ void usbctrl_handler(void)
 		usb_handle_setup_request(device);
 	}
 
+	// It seems we don't need to clear `sie_status` for this.
 	if (status & USB_INTS_BUFF_STATUS_BITS)
 		usb_handle_buffer_status(device);
 
 	if (status & USB_INTS_BUS_RESET_BITS) {
 		usb_hw_clear->sie_status = USB_SIE_STATUS_BUS_RESET_BITS;
 		usb_handle_bus_reset(device);
+	}
+
+	// See <https://github.com/hathach/tinyusb/blob/86c416d4c0fb38432460b3e11b08b9de76941bf5/src/portable/raspberrypi/rp2040/dcd_rp2040.c#L310-L328>
+	// and <https://github.com/hathach/tinyusb/blob/86c416d4c0fb38432460b3e11b08b9de76941bf5/src/portable/raspberrypi/rp2040/dcd_rp2040.c#L348-L355>.
+	//
+	// We should use connect and disconnect interrupts to turn off LED on
+	// host disconnecting (system power off), but it seems that we need to
+	// connect a VBUS detect circuit before using this, and in the example
+	// it just force VBUS detect by overriding its bit to make it always
+	// behave like connected to a host, so we cannot use this.
+	//
+	// But we will get suspend interrupts when host disconnecting in this
+	// case, and turn off LED on suspend is a reasonable behavior, so we
+	// handle this in suspend interrupts.
+
+	// if (status & USB_INTS_DEV_CONN_DIS_BITS) {
+	// 	usb_hw_clear->sie_status = USB_SIE_STATUS_CONNECTED_BITS;
+	// 	usb_handle_device_connect_disconnect(device);
+	// }
+
+	if (status & USB_INTS_DEV_SUSPEND_BITS) {
+		usb_hw_clear->sie_status = USB_SIE_STATUS_SUSPENDED_BITS;
+		usb_handle_device_suspend(device);
 	}
 }
 
@@ -411,7 +441,12 @@ void usb_init(struct usb_device *device)
 	usb_hw->muxing = USB_USB_MUXING_TO_PHY_BITS |
 			 USB_USB_MUXING_SOFTCON_BITS;
 
-	// Force VBUS detect so the device thinks it is plugged into a host.
+	// We need to connect a VBUS detect circuit to make VBUS detect work,
+	// but we don't have it, so just override the bit, then the device just
+	// thinks it is plugged into a host.
+	//
+	// This prevents device connect and disconnect interrupts, we will get
+	// suspend interrupts instead.
 	usb_hw->pwr = USB_USB_PWR_VBUS_DETECT_BITS |
 		      USB_USB_PWR_VBUS_DETECT_OVERRIDE_EN_BITS;
 
@@ -422,9 +457,9 @@ void usb_init(struct usb_device *device)
 	usb_hw->sie_ctrl = USB_SIE_CTRL_EP0_INT_1BUF_BITS;
 
 	// Enable interrupts for when a buffer is done, when the bus is reset,
-	// and when a setup packet is received
+	// when a setup packet is received, and when device suspends.
 	usb_hw->inte = USB_INTS_BUFF_STATUS_BITS | USB_INTS_BUS_RESET_BITS |
-		       USB_INTS_SETUP_REQ_BITS;
+		       USB_INTS_SETUP_REQ_BITS | USB_INTS_DEV_SUSPEND_BITS;
 
 	for (int i = 0; i < N_INTERFACES; ++i)
 		usb_init_interface(device->interfaces[i]);
@@ -472,7 +507,7 @@ void button_press(struct usb_device *device)
 	// If you want other keys, modify here.
 	buffer[HID_KEYBOARD_INDEX_KEYS] = HID_KEYBOARD_SCANCODE_ENTER;
 
-	// I already know which endpoint is for keyboard.
+	// We already know which endpoint is for keyboard.
 	//
 	// Don't send event if USB is not configured.
 	if (device->configured)
@@ -489,7 +524,7 @@ void button_release(struct usb_device *device)
 	// Release is just remove a scancode from previous event.
 	memset(&buffer[HID_KEYBOARD_INDEX_KEYS], 0, HID_KEYBOARD_MAX_KEYS);
 
-	// I already know which endpoint is for keyboard.
+	// We already know which endpoint is for keyboard.
 	//
 	// Don't send event if USB is not configured.
 	if (device->configured)
@@ -500,15 +535,13 @@ void button_release(struct usb_device *device)
 void button_on_events(uint gpio, uint32_t events)
 {
 	if (to_ms_since_boot(get_absolute_time()) - last_time > DEBOUNCE_TIME) {
-		// Recommend to not to change the position of this line to
-		// minimize the delta.
+		// Recommend to keep the position of this line to be precise.
 		last_time = to_ms_since_boot(get_absolute_time());
 
-		if (events & GPIO_IRQ_LEVEL_HIGH) {
+		if (events & GPIO_IRQ_LEVEL_HIGH)
 			button_press(device);
-		} else if (events & GPIO_IRQ_LEVEL_LOW) {
+		else if (events & GPIO_IRQ_LEVEL_LOW)
 			button_release(device);
-		}
 	}
 }
 
@@ -580,24 +613,22 @@ int main(void)
 		// If I change `wMaxPacketSize`, should I also change this?
 		.data_buffer = &usb_dpram->epx_data[0 * PACKET_SIZE]
 	};
-	/**
-	 * The specification is available here:
-	 * <https://www.usb.org/sites/default/files/hid1_11.pdf>
-	 *
-	 * In particular, read:
-	 *  - 6.2.2 Report Descriptor
-	 *  - Appendix B.1 Protocol 1 (Keyboard)
-	 *  - Appendix C: Keyboard Implementation
-	 *
-	 * Normally a basic HID keyboard uses 8 bytes:
-	 *     Modifier Reserved Key Key Key Key Key Key
-	 *
-	 * You can dump your device's report descriptor with:
-	 *
-	 *     sudo usbhid-dump -m vid:pid -e descriptor
-	 *
-	 * (change vid:pid to your device's vendor ID and product ID).
-	 */
+	// The specification is available here:
+	// <https://www.usb.org/sites/default/files/hid1_11.pdf>
+	//
+	// In particular, read:
+	//  - 6.2.2 Report Descriptor
+	//  - Appendix B.1 Protocol 1 (Keyboard)
+	//  - Appendix C: Keyboard Implementation
+	//
+	// Normally a basic HID keyboard uses 8 bytes:
+	//     Modifier Reserved Key Key Key Key Key Key
+	//
+	// You can dump your device's report descriptor with:
+	//
+	//     sudo usbhid-dump -m vid:pid -e descriptor
+	//
+	// (change vid:pid to your device's vendor ID and product ID).
 	uint8_t report_descriptor[] = {
 		// Usage Page (Generic Desktop)
 		0x05, 0x01,
@@ -710,7 +741,7 @@ int main(void)
 	struct usb_configuration_descriptor configuration_descriptor = {
 		.bLength = sizeof(configuration_descriptor),
 		.bDescriptorType = USB_DESCRIPTOR_TYPE_CONFIG,
-		// To simplify I just calculate here, if you add more
+		// To simplify I just manually calculate here, if you add more
 		// interfaces, don't forget update this.
 		.wTotalLength =
 			(sizeof(configuration_descriptor) +
