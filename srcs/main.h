@@ -59,6 +59,14 @@ struct usb_device {
 	uint8_t address;
 	bool should_set_address;
 	bool configured;
+	bool suspended;
+};
+
+struct app {
+	struct usb_device *device;
+	uint32_t last_button_events;
+	// Used to debounce.
+	uint32_t last_button_time;
 };
 
 #endif

@@ -52,9 +52,12 @@
 
 // We have to declare a global variable here, because we cannot pass arguments
 // to the interrupt handler.
-static struct usb_device *device = NULL;
-// Used to debounce.
-uint32_t last_time = 0;
+static struct app *this = NULL;
+
+static inline uint32_t get_boot_ms(void)
+{
+	return to_ms_since_boot(get_absolute_time());
+}
 
 void led_on(void)
 {
@@ -70,12 +73,49 @@ void led_init(void)
 {
 	gpio_init(LED_PIN);
 	gpio_set_dir(LED_PIN, GPIO_OUT);
+	// Turn off the LED initially.
+	led_off();
 }
+
+// When plugging/unplugging device, the D+/D- state are unstable and may
+// accidentally trigger suspend or resume (don't ask me why I am not a circuit
+// engineer, so we just skip those before we are properly configured.
 
 void usb_handle_device_suspend(struct usb_device *device)
 {
+	if (!device->configured)
+		return;
+
+	if (device->suspended)
+		return;
+
 	// Turn off the LED if device suspends.
 	led_off();
+	device->suspended = true;
+}
+
+void usb_handle_device_resume(struct usb_device *device)
+{
+	if (!device->configured)
+		return;
+
+	if (!device->suspended)
+		return;
+
+	// Turn on the LED if device resumes.
+	led_on();
+	device->suspended = false;
+}
+
+void usb_remote_wakeup(struct usb_device *device)
+{
+	if (!device->configured)
+		return;
+
+	usb_hw_set->sie_ctrl = USB_SIE_CTRL_RESUME_BITS;
+
+	// Resume itself.
+	usb_handle_device_resume(device);
 }
 
 // void usb_handle_device_connect_disconnect(struct usb_device *device)
@@ -90,6 +130,7 @@ void usb_handle_bus_reset(struct usb_device *device)
 	device->address = 0;
 	device->should_set_address = false;
 	device->configured = false;
+	device->suspended = false;
 	led_off();
 	// Don't forget to reset the actual address.
 	usb_hw->dev_addr_ctrl = 0;
@@ -247,9 +288,9 @@ void usb_get_configuration_descriptor(struct usb_device *device,
 				    MIN(length, packet->wLength));
 }
 
-uint8_t prepare_string_descriptor(uint8_t *buffer, char *str)
+uint8_t prepare_string_descriptor(uint8_t *buffer, char *string)
 {
-	uint8_t bLength = 2 + strlen(str) * 2;
+	uint8_t bLength = 2 + strlen(string) * 2;
 	uint8_t bDescriptorType = USB_DESCRIPTOR_TYPE_STRING;
 
 	*buffer++ = bLength;
@@ -260,7 +301,7 @@ uint8_t prepare_string_descriptor(uint8_t *buffer, char *str)
 	uint16_t *bString = (uint16_t *)buffer;
 	uint8_t c;
 	do {
-		c = *str++;
+		c = *string++;
 		*bString++ = c;
 	} while (c != '\0');
 
@@ -309,12 +350,48 @@ void usb_get_report_descriptor(struct usb_device *device,
 	}
 }
 
+void usb_get_status(struct usb_device *device,
+		    volatile struct usb_setup_packet *packet)
+{
+	uint8_t recipient = packet->bmRequestType &
+			    USB_REQUEST_TYPE_RECIPIENT_MASK;
+	// If you need the actual interface/endpoint number, read the `wIndex`
+	// field, I just don't need it here.
+	//
+	// The `wLength` should always be 2, if not, stop buying devices from
+	// that vendor.
+	if (recipient == USB_REQUEST_TYPE_RECIPIENT_DEVICE) {
+		// Just keep sending existing `bmAttributes` from configuration
+		// descriptor, they are the same.
+		usb_endpoint_start_transfer(
+			device->ep0_in,
+			&device->configuration_descriptor->bmAttributes,
+			MIN(2, packet->wLength));
+	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_INTERFACE) {
+		// All bits are reserved for interface.
+		uint8_t reserved[2] = { 0, 0 };
+		usb_endpoint_start_transfer(device->ep0_in, reserved,
+					    MIN(sizeof(reserved),
+						packet->wLength));
+	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
+		// We just never halt.
+		uint8_t endpoint_status[2] = { 0, 0 };
+		usb_endpoint_start_transfer(device->ep0_in, endpoint_status,
+					    MIN(sizeof(endpoint_status),
+						packet->wLength));
+	} else {
+		// Why are you falling here? When I write this program those
+		// values are reserved, are you still a human?
+	}
+}
+
 void usb_handle_setup_request(struct usb_device *device)
 {
 	volatile struct usb_setup_packet *packet =
 		(struct usb_setup_packet *)&usb_dpram->setup_packet;
 	// The 7th bit is direction.
-	uint8_t direction = packet->bmRequestType & 0x80;
+	uint8_t direction = packet->bmRequestType &
+			    USB_REQUEST_TYPE_DIRECTION_MASK;
 	uint8_t request = packet->bRequest;
 
 	// See Control Transfer in <https://www.usbmadesimple.co.uk/ums_3.htm>.
@@ -358,14 +435,21 @@ void usb_handle_setup_request(struct usb_device *device)
 			default:
 				break;
 			}
+		} else if (request == USB_REQUEST_GET_STATUS) {
+			// I try to dump debug stream from Linux kernel, it
+			// seems you need to answer to a `GET_STATUS` request
+			// after resume, otherwise it will return a IO error
+			// and disconnect/reconnect the device.
+			usb_get_status(device, packet);
 		}
 		// So for IN request, we use OUT endpoint.
 		usb_endpoint_ack(device->ep0_out);
 	}
 }
 
-void usbctrl_handler(void)
+void usb_on_events(void)
 {
+	struct usb_device *device = this->device;
 	uint32_t status = usb_hw->ints;
 
 	if (status & USB_INTS_SETUP_REQ_BITS) {
@@ -403,6 +487,11 @@ void usbctrl_handler(void)
 	if (status & USB_INTS_DEV_SUSPEND_BITS) {
 		usb_hw_clear->sie_status = USB_SIE_STATUS_SUSPENDED_BITS;
 		usb_handle_device_suspend(device);
+	}
+
+	if (status & USB_INTS_DEV_RESUME_FROM_HOST_BITS) {
+		usb_hw_clear->sie_status = USB_SIE_STATUS_RESUME_BITS;
+		usb_handle_device_resume(device);
 	}
 }
 
@@ -457,9 +546,11 @@ void usb_init(struct usb_device *device)
 	usb_hw->sie_ctrl = USB_SIE_CTRL_EP0_INT_1BUF_BITS;
 
 	// Enable interrupts for when a buffer is done, when the bus is reset,
-	// when a setup packet is received, and when device suspends.
+	// when a setup packet is received, when device suspends, and when
+	// device resumes.
 	usb_hw->inte = USB_INTS_BUFF_STATUS_BITS | USB_INTS_BUS_RESET_BITS |
-		       USB_INTS_SETUP_REQ_BITS | USB_INTS_DEV_SUSPEND_BITS;
+		       USB_INTS_SETUP_REQ_BITS | USB_INTS_DEV_SUSPEND_BITS |
+		       USB_INTS_DEV_RESUME_FROM_HOST_BITS;
 
 	for (int i = 0; i < N_INTERFACES; ++i)
 		usb_init_interface(device->interfaces[i]);
@@ -470,7 +561,7 @@ void usb_init(struct usb_device *device)
 	// Enable USB interrupt at processor.
 	irq_set_enabled(USBCTRL_IRQ, true);
 	// Set interrupt handler for USB.
-	irq_set_exclusive_handler(USBCTRL_IRQ, usbctrl_handler);
+	irq_set_exclusive_handler(USBCTRL_IRQ, usb_on_events);
 }
 
 void ep0_in_on_complete(struct usb_endpoint *endpoint,
@@ -496,8 +587,13 @@ void ep1_in_on_complete(struct usb_endpoint *endpoint,
 {
 }
 
+// Don't send event if USB is not configured.
+
 void button_press(struct usb_device *device)
 {
+	if (!device->configured)
+		return;
+
 	uint8_t buffer[HID_KEYBOARD_EVENT_SIZE];
 
 	buffer[HID_KEYBOARD_INDEX_MODIFIER] = HID_KEYBOARD_MODIFIER_NONE;
@@ -508,15 +604,15 @@ void button_press(struct usb_device *device)
 	buffer[HID_KEYBOARD_INDEX_KEYS] = HID_KEYBOARD_SCANCODE_ENTER;
 
 	// We already know which endpoint is for keyboard.
-	//
-	// Don't send event if USB is not configured.
-	if (device->configured)
-		usb_endpoint_start_transfer(device->interfaces[0]->endpoints[0],
-					    buffer, sizeof(buffer));
+	usb_endpoint_start_transfer(device->interfaces[0]->endpoints[0], buffer,
+				    sizeof(buffer));
 }
 
 void button_release(struct usb_device *device)
 {
+	if (!device->configured)
+		return;
+
 	uint8_t buffer[HID_KEYBOARD_EVENT_SIZE];
 
 	buffer[HID_KEYBOARD_INDEX_MODIFIER] = HID_KEYBOARD_MODIFIER_NONE;
@@ -525,23 +621,36 @@ void button_release(struct usb_device *device)
 	memset(&buffer[HID_KEYBOARD_INDEX_KEYS], 0, HID_KEYBOARD_MAX_KEYS);
 
 	// We already know which endpoint is for keyboard.
-	//
-	// Don't send event if USB is not configured.
-	if (device->configured)
-		usb_endpoint_start_transfer(device->interfaces[0]->endpoints[0],
-					    buffer, sizeof(buffer));
+	usb_endpoint_start_transfer(device->interfaces[0]->endpoints[0], buffer,
+				    sizeof(buffer));
 }
 
 void button_on_events(uint gpio, uint32_t events)
 {
-	if (to_ms_since_boot(get_absolute_time()) - last_time > DEBOUNCE_TIME) {
-		// Recommend to keep the position of this line to be precise.
-		last_time = to_ms_since_boot(get_absolute_time());
+	struct usb_device *device = this->device;
 
-		if (events & GPIO_IRQ_LEVEL_HIGH)
-			button_press(device);
-		else if (events & GPIO_IRQ_LEVEL_LOW)
-			button_release(device);
+	// It looks like Pico has Schmitt triggers and by default enabling it,
+	// so maybe this software debouncing is not needed, but keeping it is
+	// harmless.
+	if (get_boot_ms() - this->last_button_time > DEBOUNCE_TIME) {
+		// Recommend to keep the position of this line to be precise.
+		this->last_button_time = get_boot_ms();
+
+		// Pico triggers GPIO events as a timer! So I need to manually
+		// skip repeated events.
+		if (events != this->last_button_events) {
+			this->last_button_events = events;
+
+			// Because this is a HID keyboard, if it is suspended,
+			// it requires a remote wakeup on button events.
+			if (device->suspended)
+				usb_remote_wakeup(device);
+
+			if (events & GPIO_IRQ_LEVEL_HIGH)
+				button_press(device);
+			else if (events & GPIO_IRQ_LEVEL_LOW)
+				button_release(device);
+		}
 	}
 }
 
@@ -549,7 +658,7 @@ void button_init(void)
 {
 	gpio_pull_down(BUTTON_PIN);
 	gpio_set_irq_enabled_with_callback(
-		BUTTON_PIN, GPIO_IRQ_LEVEL_LOW | GPIO_IRQ_LEVEL_HIGH, true,
+		BUTTON_PIN, GPIO_IRQ_LEVEL_HIGH | GPIO_IRQ_LEVEL_LOW, true,
 		&button_on_events);
 }
 
@@ -786,7 +895,7 @@ int main(void)
 		// One configuration.
 		.bNumConfigurations = 1
 	};
-	struct usb_device dev0 = {
+	struct usb_device device = {
 		.descriptor = &descriptor,
 		.configuration_descriptor = &configuration_descriptor,
 		.string_descriptor = &string_descriptor,
@@ -797,6 +906,9 @@ int main(void)
 			"AZButton Pico",
 			// Serial Number.
 			// Actually it is a string, so just put anything I want.
+			// You'd better change this if you are flashing
+			// different chips, otherwise they are the same to one
+			// host.
 			"Strelizia"
 		},
 		.ep0_in = &ep0_in,
@@ -804,14 +916,17 @@ int main(void)
 		.interfaces = {&if0},
 		.address = 0,
 		.should_set_address = false,
-		.configured = false
+		.configured = false,
+		.suspended = false
 	};
+	struct app app = { .device = &device,
+			   .last_button_events = 0,
+			   .last_button_time = get_boot_ms() };
 
-	device = &dev0;
-	last_time = to_ms_since_boot(get_absolute_time());
+	this = &app;
 
 	led_init();
-	usb_init(device);
+	usb_init(this->device);
 	button_init();
 
 	// Start main loop.
