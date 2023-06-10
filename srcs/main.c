@@ -218,16 +218,12 @@ void usb_endpoint_start_transfer(struct usb_endpoint *endpoint, uint8_t *buffer,
 	*(endpoint->buffer_control) = value;
 }
 
-void usb_endpoint_ack(struct usb_endpoint *endpoint)
-{
-	usb_endpoint_start_transfer(endpoint, NULL, 0);
-}
-
 void usb_set_address(struct usb_device *device,
 		     volatile struct usb_setup_packet *packet)
 {
-	// According to the standard, we are not assumed to change address
-	// immediately, we must to respond from address 0 first. So we delay it.
+	// According to the standard, we are not expected to change address
+	// immediately, we must to finish STATUS stage of Control Transfer from
+	// address 0 first, so we delay it to EP0 in's complete callback.
 	device->address = (packet->wValue & 0xff);
 	device->should_set_address = true;
 }
@@ -443,13 +439,15 @@ void usb_handle_setup_request(struct usb_device *device)
 
 	// See Control Transfer in <https://www.usbmadesimple.co.uk/ums_3.htm>.
 	//
-	// Control always starts from DATA1 so reset PID to 1 for EP0 IN.
+	// Control Transfer has 3 stage: SETUP, DATA and STATUS.
 	//
-	// Control has 3 stage: SETUP, DATA and STATUS. In STATUS, we need to
-	// send ACK from the other endpoint.
-	device->ep0_in->next_pid = 1;
+	// We already finished SETUP stage by receiving the setup packet.
 
+	// Then we are in DATA stage, this is optional because most OUT
+	// transfers has no data. But no matter it is IN or OUT, it always
+	// starts from DATA1.
 	if (direction == USB_DIRECTION_OUT) {
+		device->ep0_out->next_pid = 1;
 		switch (request) {
 		case USB_REQUEST_SET_ADDRESS:
 			usb_set_address(device, packet);
@@ -466,9 +464,8 @@ void usb_handle_setup_request(struct usb_device *device)
 		default:
 			break;
 		}
-		// So for OUT request, we use IN endpoint.
-		usb_endpoint_ack(device->ep0_in);
 	} else if (direction == USB_DIRECTION_IN) {
+		device->ep0_in->next_pid = 1;
 		if (request == USB_REQUEST_GET_DESCRIPTOR) {
 			uint16_t descriptor_type = packet->wValue >> 8;
 			switch (descriptor_type) {
@@ -495,8 +492,16 @@ void usb_handle_setup_request(struct usb_device *device)
 			// and disconnect/reconnect the device.
 			usb_get_status(device, packet);
 		}
-		// So for IN request, we use OUT endpoint.
-		usb_endpoint_ack(device->ep0_out);
+	}
+
+	// After DATA stage, the last one is STATUS stage, we need to send
+	// zero-length DATA1 packet from the other direction.
+	if (direction == USB_DIRECTION_OUT) {
+		device->ep0_in->next_pid = 1;
+		usb_endpoint_start_transfer(device->ep0_in, NULL, 0);
+	} else if (direction == USB_DIRECTION_IN) {
+		device->ep0_out->next_pid = 1;
+		usb_endpoint_start_transfer(device->ep0_out, NULL, 0);
 	}
 }
 
@@ -621,7 +626,7 @@ void ep0_in_on_complete(struct usb_endpoint *endpoint,
 			struct usb_device *device, uint8_t *buffer,
 			uint16_t length)
 {
-	// We delay setting address until we finished the STATUS (ACK packet).
+	// Set address when we finished the STATUS stage from address 0.
 	if (device->should_set_address) {
 		device->should_set_address = false;
 		usb_hw->dev_addr_ctrl = device->address;
