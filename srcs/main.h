@@ -58,6 +58,7 @@ struct usb_device {
 	struct usb_interface *interfaces[N_INTERFACES];
 	uint8_t address;
 	bool should_set_address;
+	bool could_remote_wakeup;
 	bool configured;
 	bool suspended;
 };

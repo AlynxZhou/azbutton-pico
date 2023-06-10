@@ -1,5 +1,5 @@
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 // USB register definitions from pico-sdk.
 #include "hardware/regs/usb.h"
@@ -110,6 +110,9 @@ void usb_handle_device_resume(struct usb_device *device)
 void usb_remote_wakeup(struct usb_device *device)
 {
 	if (!device->configured)
+		return;
+
+	if (!device->could_remote_wakeup)
 		return;
 
 	usb_hw_set->sie_ctrl = USB_SIE_CTRL_RESUME_BITS;
@@ -234,6 +237,46 @@ void usb_set_configuration(struct usb_device *device,
 {
 	device->configured = true;
 	led_on();
+}
+
+void usb_set_feature(struct usb_device *device,
+		     volatile struct usb_setup_packet *packet)
+{
+	uint8_t recipient = packet->bmRequestType &
+			    USB_REQUEST_TYPE_RECIPIENT_MASK;
+	uint16_t wValue = packet->wValue;
+	uint16_t wIndex = packet->wIndex;
+	if (recipient == USB_REQUEST_TYPE_RECIPIENT_DEVICE) {
+		// This is the only device feature that can be clear.
+		if (wValue == USB_FEATURE_DEVICE_REMOTE_WAKEUP) {
+			device->could_remote_wakeup = true;
+		} else if (wValue == USB_FEATURE_TEST_MODE) {
+			// Too complicated, I just don't implement it.
+		}
+	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
+		if (wValue == USB_FEATURE_ENDPOINT_HALT) {
+			// Not implemented.
+		}
+	}
+}
+
+void usb_clear_feature(struct usb_device *device,
+		       volatile struct usb_setup_packet *packet)
+{
+	uint8_t recipient = packet->bmRequestType &
+			    USB_REQUEST_TYPE_RECIPIENT_MASK;
+	uint16_t wValue = packet->wValue;
+	uint16_t wIndex = packet->wIndex;
+	if (recipient == USB_REQUEST_TYPE_RECIPIENT_DEVICE) {
+		// This is the only device feature that can be clear.
+		if (wValue == USB_FEATURE_DEVICE_REMOTE_WAKEUP) {
+			device->could_remote_wakeup = false;
+		}
+	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
+		if (wValue == USB_FEATURE_ENDPOINT_HALT) {
+			// Not implemented.
+		}
+	}
 }
 
 void usb_get_device_descriptor(struct usb_device *device,
@@ -361,23 +404,27 @@ void usb_get_status(struct usb_device *device,
 	// The `wLength` should always be 2, if not, stop buying devices from
 	// that vendor.
 	if (recipient == USB_REQUEST_TYPE_RECIPIENT_DEVICE) {
-		// Just keep sending existing `bmAttributes` from configuration
-		// descriptor, they are the same.
-		usb_endpoint_start_transfer(
-			device->ep0_in,
-			&device->configuration_descriptor->bmAttributes,
-			MIN(2, packet->wLength));
+		// Well, the actual values are the same with `bmAttributes` in
+		// configuration descriptor, but the positions are not.
+		//
+		// This device is bus-powered so only check remote wakeup.
+		uint8_t status[2] = { 0x00, device->could_remote_wakeup ?
+						    0x02 :
+						    0x00 };
+		usb_endpoint_start_transfer(device->ep0_in, status,
+					    MIN(sizeof(status),
+						packet->wLength));
 	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_INTERFACE) {
 		// All bits are reserved for interface.
-		uint8_t reserved[2] = { 0, 0 };
-		usb_endpoint_start_transfer(device->ep0_in, reserved,
-					    MIN(sizeof(reserved),
+		uint8_t status[2] = { 0x00, 0x00 };
+		usb_endpoint_start_transfer(device->ep0_in, status,
+					    MIN(sizeof(status),
 						packet->wLength));
 	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
 		// We just never halt.
-		uint8_t endpoint_status[2] = { 0, 0 };
-		usb_endpoint_start_transfer(device->ep0_in, endpoint_status,
-					    MIN(sizeof(endpoint_status),
+		uint8_t status[2] = { 0x00, 0x00 };
+		usb_endpoint_start_transfer(device->ep0_in, status,
+					    MIN(sizeof(status),
 						packet->wLength));
 	} else {
 		// Why are you falling here? When I write this program those
@@ -409,6 +456,12 @@ void usb_handle_setup_request(struct usb_device *device)
 			break;
 		case USB_REQUEST_SET_CONFIGURATION:
 			usb_set_configuration(device, packet);
+			break;
+		case USB_REQUEST_SET_FEATURE:
+			usb_set_feature(device, packet);
+			break;
+		case USB_REQUEST_CLEAR_FEATURE:
+			usb_clear_feature(device, packet);
 			break;
 		default:
 			break;
@@ -526,7 +579,7 @@ void usb_init(struct usb_device *device)
 	// Clear any previous state in dpram just in case.
 	memset(usb_dpram, 0, sizeof(*usb_dpram));
 
-	// Mux the controller to the onboard usb phy.
+	// Mux the controller to the onboard usb PHY.
 	usb_hw->muxing = USB_USB_MUXING_TO_PHY_BITS |
 			 USB_USB_MUXING_SOFTCON_BITS;
 
@@ -674,14 +727,12 @@ int main(void)
 		.wMaxPacketSize = PACKET_SIZE,
 		.bInterval = 0
 	};
-	struct usb_endpoint ep0_in = {
-		.descriptor = &ep0_in_descriptor,
-		.on_complete = &ep0_in_on_complete,
-		.endpoint_control = NULL,
-		.buffer_control = &usb_dpram->ep_buf_ctrl[0].in,
-		// EP0 in and out share the same data buffer.
-		.data_buffer = &usb_dpram->ep0_buf_a[0]
-	};
+	struct usb_endpoint ep0_in = { .descriptor = &ep0_in_descriptor,
+				       .on_complete = &ep0_in_on_complete,
+				       .endpoint_control = NULL,
+				       .buffer_control =
+					       &usb_dpram->ep_buf_ctrl[0].in,
+				       .data_buffer = usb_dpram->ep0_buf_a };
 	struct usb_endpoint_descriptor ep0_out_descriptor = {
 		.bLength = sizeof(ep0_out_descriptor),
 		.bDescriptorType = USB_DESCRIPTOR_TYPE_ENDPOINT,
@@ -691,14 +742,12 @@ int main(void)
 		.wMaxPacketSize = PACKET_SIZE,
 		.bInterval = 0
 	};
-	struct usb_endpoint ep0_out = {
-		.descriptor = &ep0_out_descriptor,
-		.on_complete = &ep0_out_on_complete,
-		.endpoint_control = NULL,
-		.buffer_control = &usb_dpram->ep_buf_ctrl[0].out,
-		// EP0 in and out share the same data buffer.
-		.data_buffer = &usb_dpram->ep0_buf_a[0]
-	};
+	struct usb_endpoint ep0_out = { .descriptor = &ep0_out_descriptor,
+					.on_complete = &ep0_out_on_complete,
+					.endpoint_control = NULL,
+					.buffer_control =
+						&usb_dpram->ep_buf_ctrl[0].out,
+					.data_buffer = usb_dpram->ep0_buf_b };
 	struct usb_endpoint_descriptor ep1_in_descriptor = {
 		.bLength = sizeof(ep1_in_descriptor),
 		.bDescriptorType = USB_DESCRIPTOR_TYPE_ENDPOINT,
@@ -916,6 +965,7 @@ int main(void)
 		.interfaces = {&if0},
 		.address = 0,
 		.should_set_address = false,
+		.could_remote_wakeup = true,
 		.configured = false,
 		.suspended = false
 	};
