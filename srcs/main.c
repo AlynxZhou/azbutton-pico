@@ -185,9 +185,6 @@ void usb_handle_buffer_status(struct usb_device *device)
 								device);
 		}
 	}
-
-	// Clear the status.
-	usb_hw_clear->buf_status = buffers;
 }
 
 void usb_endpoint_start_transfer(struct usb_endpoint *endpoint, uint8_t *buffer,
@@ -511,17 +508,19 @@ void usb_on_events(void)
 	uint32_t status = usb_hw->ints;
 
 	if (status & USB_INTS_SETUP_REQ_BITS) {
-		usb_hw_clear->sie_status = USB_SIE_STATUS_SETUP_REC_BITS;
 		usb_handle_setup_request(device);
+		usb_hw_clear->sie_status = USB_SIE_STATUS_SETUP_REC_BITS;
 	}
 
-	// It seems we don't need to clear `sie_status` for this.
-	if (status & USB_INTS_BUFF_STATUS_BITS)
+	if (status & USB_INTS_BUFF_STATUS_BITS) {
 		usb_handle_buffer_status(device);
+		// This is cleared by clearing all bits in `buf_status`.
+		usb_hw_clear->buf_status = usb_hw->buf_status;
+	}
 
 	if (status & USB_INTS_BUS_RESET_BITS) {
-		usb_hw_clear->sie_status = USB_SIE_STATUS_BUS_RESET_BITS;
 		usb_handle_bus_reset(device);
+		usb_hw_clear->sie_status = USB_SIE_STATUS_BUS_RESET_BITS;
 	}
 
 	// See <https://github.com/hathach/tinyusb/blob/86c416d4c0fb38432460b3e11b08b9de76941bf5/src/portable/raspberrypi/rp2040/dcd_rp2040.c#L310-L328>
@@ -538,18 +537,18 @@ void usb_on_events(void)
 	// handle this in suspend interrupts.
 
 	// if (status & USB_INTS_DEV_CONN_DIS_BITS) {
-	// 	usb_hw_clear->sie_status = USB_SIE_STATUS_CONNECTED_BITS;
 	// 	usb_handle_device_connect_disconnect(device);
+	// 	usb_hw_clear->sie_status = USB_SIE_STATUS_CONNECTED_BITS;
 	// }
 
 	if (status & USB_INTS_DEV_SUSPEND_BITS) {
-		usb_hw_clear->sie_status = USB_SIE_STATUS_SUSPENDED_BITS;
 		usb_handle_device_suspend(device);
+		usb_hw_clear->sie_status = USB_SIE_STATUS_SUSPENDED_BITS;
 	}
 
 	if (status & USB_INTS_DEV_RESUME_FROM_HOST_BITS) {
-		usb_hw_clear->sie_status = USB_SIE_STATUS_RESUME_BITS;
 		usb_handle_device_resume(device);
+		usb_hw_clear->sie_status = USB_SIE_STATUS_RESUME_BITS;
 	}
 }
 
