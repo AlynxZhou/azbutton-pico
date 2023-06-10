@@ -21,6 +21,10 @@
 #define EP0_OUT_ADDRESS (USB_DIRECTION_OUT | 0)
 #define EP1_IN_ADDRESS (USB_DIRECTION_IN | 1)
 
+// Because now I implemented multi-packet transfer, it should be OK to change
+// this to a smaller size, but if this is too small, it might be too slow to
+// reply setup (too much data to send and transfer is blocked), so just use
+// 32 or 64.
 #define PACKET_SIZE 64
 
 #define usb_hw_set hw_set_alias(usb_hw)
@@ -79,7 +83,7 @@ void led_init(void)
 
 // When plugging/unplugging device, the D+/D- state are unstable and may
 // accidentally trigger suspend or resume (don't ask me why I am not a circuit
-// engineer, so we just skip those before we are properly configured.
+// engineer), so we just skip those before we are properly configured.
 
 void usb_handle_device_suspend(struct usb_device *device)
 {
@@ -139,18 +143,98 @@ void usb_handle_bus_reset(struct usb_device *device)
 	usb_hw->dev_addr_ctrl = 0;
 }
 
-void usb_endpoint_handle_buffer_done(struct usb_endpoint *endpoint,
-				     struct usb_device *device)
-{
-	uint32_t buffer_control = *(endpoint->buffer_control);
-	uint16_t length = buffer_control & USB_BUF_CTRL_LEN_MASK;
-	endpoint->on_complete(endpoint, device,
-			      (uint8_t *)endpoint->data_buffer, length);
-}
-
 static inline bool usb_endpoint_is_in(struct usb_endpoint *endpoint)
 {
 	return endpoint->descriptor->bEndpointAddress & USB_DIRECTION_IN;
+}
+
+void usb_endpoint_handle_packet_next(struct usb_endpoint *endpoint)
+{
+	uint32_t remaining_length =
+		endpoint->user_buffer_length - endpoint->transferred_length;
+	uint16_t length =
+		MIN(remaining_length, endpoint->descriptor->wMaxPacketSize);
+
+	// Tell the USB controller our desired length for this packet, but we
+	// may not send so much data actually, so we don't update transferred
+	// length here.
+	//
+	// The control flags use the higher byte, and length uses the lower
+	// byte, so they won't conflict.
+	uint32_t value = length | USB_BUF_CTRL_AVAIL;
+
+	if (usb_endpoint_is_in(endpoint)) {
+		if (endpoint->user_buffer != NULL) {
+			memcpy((void *)endpoint->data_buffer,
+			       endpoint->user_buffer +
+				       endpoint->transferred_length,
+			       length);
+		}
+		value |= USB_BUF_CTRL_FULL;
+	}
+
+	if (endpoint->next_pid == 1) {
+		value |= USB_BUF_CTRL_DATA1_PID;
+		endpoint->next_pid = 0;
+	} else {
+		value |= USB_BUF_CTRL_DATA0_PID;
+		endpoint->next_pid = 1;
+	}
+
+	if (endpoint->transferred_length + length >=
+	    endpoint->user_buffer_length)
+		value |= USB_BUF_CTRL_LAST;
+
+	// Set the actuall buffer control register to let the USB controller
+	// start to work.
+	*endpoint->buffer_control = value & ~USB_BUF_CTRL_AVAIL;
+	// According to the datasheet, we have to wait before set available bit
+	// to prevent from concurrent accessing.
+	__asm volatile("b 1f\n"
+		       "1: b 1f\n"
+		       "1: b 1f\n"
+		       "1: b 1f\n"
+		       "1: b 1f\n"
+		       "1: b 1f\n"
+		       "1:\n"
+		       :
+		       :
+		       : "memory");
+	*endpoint->buffer_control = value;
+}
+
+void usb_endpoint_handle_packet_done(struct usb_endpoint *endpoint,
+				     struct usb_device *device)
+{
+	uint32_t buffer_control = *endpoint->buffer_control;
+	// Get the actual length of this packet. We will use this to
+	// update transferred length.
+	uint16_t length = buffer_control & USB_BUF_CTRL_LEN_MASK;
+
+	if (!usb_endpoint_is_in(endpoint))
+		if (endpoint->user_buffer != NULL)
+			memcpy(endpoint->user_buffer +
+				       endpoint->transferred_length,
+			       (void *)endpoint->data_buffer, length);
+
+	endpoint->transferred_length += length;
+
+	// Comparing transferred length and user buffer length is not enough,
+	// when reading from host, we may use a larger user buffer that cannot
+	// be totally filled by host. If the actual length of this packet is
+	// smaller than `wMaxPacketSize`, we know there is no more packet.
+	if (endpoint->transferred_length >= endpoint->user_buffer_length ||
+	    length < endpoint->descriptor->wMaxPacketSize) {
+		// Reset state after callback, so you can handle such things in
+		// callback.
+		endpoint->on_complete(endpoint, device);
+		endpoint->busy = false;
+		endpoint->user_buffer = NULL;
+		endpoint->user_buffer_length = 0;
+		endpoint->transferred_length = 0;
+	} else {
+		usb_endpoint_handle_packet_next(endpoint);
+	}
 }
 
 static inline uint32_t
@@ -170,9 +254,9 @@ void usb_handle_buffer_status(struct usb_device *device)
 
 	// Check EP0 first.
 	if (buffers & (1 << usb_endpoint_address_to_bit(device->ep0_in)))
-		usb_endpoint_handle_buffer_done(device->ep0_in, device);
+		usb_endpoint_handle_packet_done(device->ep0_in, device);
 	if (buffers & (1 << usb_endpoint_address_to_bit(device->ep0_out)))
-		usb_endpoint_handle_buffer_done(device->ep0_out, device);
+		usb_endpoint_handle_packet_done(device->ep0_out, device);
 
 	// Check endpoints belongs to interfaces.
 	for (int i = 0; i < N_INTERFACES; ++i) {
@@ -180,39 +264,45 @@ void usb_handle_buffer_status(struct usb_device *device)
 		for (int j = 0; j < interface->n_endpoints; ++j) {
 			struct usb_endpoint *endpoint = interface->endpoints[j];
 			if (buffers &
-			    (1 << usb_endpoint_address_to_bit(endpoint)))
-				usb_endpoint_handle_buffer_done(endpoint,
+			    (1 << usb_endpoint_address_to_bit(endpoint))) {
+				usb_endpoint_handle_packet_done(endpoint,
 								device);
+			}
 		}
 	}
 }
 
-void usb_endpoint_start_transfer(struct usb_endpoint *endpoint, uint8_t *buffer,
-				 uint16_t length)
+// Actual transfer is done by the USB controller.
+//
+// IN transfer:
+//   1. Fill endpoint's data packet buffer with data we need to send in user's
+//      data buffer.
+//   2. Tell the USB controller this endpoint is ready.
+//   3. The USB controller will send data to host from endpoint's data packet
+//      buffer.
+//
+// OUT transfer:
+//   1. Tell the USB controller this endpoint is ready.
+//   2. The USB controller will receive data from host to endpoint's data packet
+//      buffer.
+//   3. Fill user's data buffer with data just received in endpoint's data
+//      packet buffer.
+int usb_endpoint_start_transfer(struct usb_endpoint *endpoint, uint8_t *buffer,
+				uint32_t length)
 {
-	// We limit max buffer length to 64, which is max size of one packet.
-	if (length > PACKET_SIZE)
-		length = PACKET_SIZE;
+	// Caller should prepare a queue and only start new transfer in complete
+	// callback.
+	if (endpoint->busy)
+		return -1;
 
-	// We store buffer length in `buffer_control`, so we could get length
-	// in complete callback. The control flags use the higher byte, and
-	// length uses the lower byte, so they won't conflict.
-	uint32_t value = length | USB_BUF_CTRL_AVAIL;
+	endpoint->busy = true;
+	endpoint->user_buffer = buffer;
+	endpoint->user_buffer_length = length;
+	endpoint->transferred_length = 0;
 
-	if (usb_endpoint_is_in(endpoint)) {
-		memcpy((void *)endpoint->data_buffer, buffer, length);
-		value |= USB_BUF_CTRL_FULL;
-	}
+	usb_endpoint_handle_packet_next(endpoint);
 
-	if (endpoint->next_pid == 1) {
-		value |= USB_BUF_CTRL_DATA1_PID;
-		endpoint->next_pid = 0;
-	} else {
-		value |= USB_BUF_CTRL_DATA0_PID;
-		endpoint->next_pid = 1;
-	}
-
-	*(endpoint->buffer_control) = value;
+	return 0;
 }
 
 void usb_set_address(struct usb_device *device,
@@ -221,7 +311,7 @@ void usb_set_address(struct usb_device *device,
 	// According to the standard, we are not expected to change address
 	// immediately, we must to finish STATUS stage of Control Transfer from
 	// address 0 first, so we delay it to EP0 in's complete callback.
-	device->address = (packet->wValue & 0xff);
+	device->address = packet->wValue & 0xff;
 	device->should_set_address = true;
 }
 
@@ -249,6 +339,8 @@ void usb_set_feature(struct usb_device *device,
 	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
 		if (wValue == USB_FEATURE_ENDPOINT_HALT) {
 			// Not implemented.
+			// TODO: First implement STALL/NAK, which should be done
+			// by writing registers to controll the USB controller.
 		}
 	}
 }
@@ -268,6 +360,8 @@ void usb_clear_feature(struct usb_device *device,
 	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
 		if (wValue == USB_FEATURE_ENDPOINT_HALT) {
 			// Not implemented.
+			// TODO: First implement STALL/NAK, which should be done
+			// by writing registers to controll the USB controller.
 		}
 	}
 }
@@ -283,7 +377,10 @@ void usb_get_device_descriptor(struct usb_device *device,
 void usb_get_configuration_descriptor(struct usb_device *device,
 				      volatile struct usb_setup_packet *packet)
 {
-	uint8_t start[PACKET_SIZE];
+	uint8_t *start = malloc(device->configuration_descriptor->wTotalLength);
+	if (start == NULL)
+		return;
+
 	uint8_t *buffer = start;
 
 	memcpy(buffer, device->configuration_descriptor,
@@ -293,55 +390,31 @@ void usb_get_configuration_descriptor(struct usb_device *device,
 	// According to USB specification, we should also provide interface
 	// descriptors, HID descriptors and endpoint descriptors along with
 	// configuration descriptors.
-	//
-	// What if we have too much data? I don't know, but 64 bytes should be
-	// enough for such a simple device.
-	if (PACKET_SIZE >= device->configuration_descriptor->wTotalLength &&
-	    packet->wLength >= device->configuration_descriptor->wTotalLength) {
-		for (int i = 0; i < N_INTERFACES; ++i) {
-			struct usb_interface *interface = device->interfaces[i];
-			// Interface descriptor.
-			memcpy(buffer, interface->descriptor,
-			       interface->descriptor->bLength);
-			buffer += interface->descriptor->bLength;
-			// HID descriptor.
-			memcpy(buffer, interface->hid_descriptor,
-			       interface->hid_descriptor->bLength);
-			buffer += interface->hid_descriptor->bLength;
-			for (int j = 0; j < interface->n_endpoints; ++j) {
-				struct usb_endpoint *endpoint =
-					interface->endpoints[j];
-				// Endpoint descriptor.
-				memcpy(buffer, endpoint->descriptor,
-				       endpoint->descriptor->bLength);
-				buffer += endpoint->descriptor->bLength;
-			}
+
+	for (int i = 0; i < N_INTERFACES; ++i) {
+		struct usb_interface *interface = device->interfaces[i];
+		// Interface descriptor.
+		memcpy(buffer, interface->descriptor,
+		       interface->descriptor->bLength);
+		buffer += interface->descriptor->bLength;
+		// HID descriptor.
+		memcpy(buffer, interface->hid_descriptor,
+		       interface->hid_descriptor->bLength);
+		buffer += interface->hid_descriptor->bLength;
+		for (int j = 0; j < interface->n_endpoints; ++j) {
+			struct usb_endpoint *endpoint = interface->endpoints[j];
+			// Endpoint descriptor.
+			memcpy(buffer, endpoint->descriptor,
+			       endpoint->descriptor->bLength);
+			buffer += endpoint->descriptor->bLength;
 		}
 	}
 
-	uint16_t length = buffer - start;
-	usb_endpoint_start_transfer(device->ep0_in, start,
-				    MIN(length, packet->wLength));
-}
-
-uint8_t prepare_string_descriptor(uint8_t *buffer, char *string)
-{
-	uint8_t bLength = 2 + strlen(string) * 2;
-	uint8_t bDescriptorType = USB_DESCRIPTOR_TYPE_STRING;
-
-	*buffer++ = bLength;
-	*buffer++ = bDescriptorType;
-
-	// For alpha and number, Unicode is just ASCII in lower byte and 0 in
-	// higher byte.
-	uint16_t *bString = (uint16_t *)buffer;
-	uint8_t c;
-	do {
-		c = *string++;
-		*bString++ = c;
-	} while (c != '\0');
-
-	return bLength;
+	usb_endpoint_start_transfer(
+		device->ep0_in, start,
+		MIN(device->configuration_descriptor->wTotalLength,
+		    packet->wLength));
+	free(start);
 }
 
 void usb_get_string_descriptor(struct usb_device *device,
@@ -358,19 +431,37 @@ void usb_get_string_descriptor(struct usb_device *device,
 			MIN(device->string_descriptor->bLength,
 			    packet->wLength));
 	} else {
-		uint8_t buffer[PACKET_SIZE];
 		// Yes, USB specification says index starts from 1.
-		uint8_t length = prepare_string_descriptor(
-			buffer, device->descriptor_strings[index - 1]);
-		usb_endpoint_start_transfer(device->ep0_in, buffer,
-					    MIN(length, packet->wLength));
+		char *string = device->descriptor_strings[index - 1];
+		uint8_t bLength = 2 + strlen(string) * 2;
+		uint8_t *start = malloc(bLength);
+		if (start == NULL)
+			return;
+		uint8_t *buffer = start;
+		uint8_t bDescriptorType = USB_DESCRIPTOR_TYPE_STRING;
+
+		*buffer++ = bLength;
+		*buffer++ = bDescriptorType;
+
+		// For alpha and number, Unicode is just ASCII in lower byte and
+		// 0 in higher byte.
+		uint16_t *bString = (uint16_t *)buffer;
+		uint8_t c;
+		do {
+			c = *string++;
+			*bString++ = c;
+		} while (c != '\0');
+
+		usb_endpoint_start_transfer(device->ep0_in, start,
+					    MIN(bLength, packet->wLength));
+		free(start);
 	}
 }
 
 void usb_get_report_descriptor(struct usb_device *device,
 			       volatile struct usb_setup_packet *packet)
 {
-	// In HID, wIndex is interface number.
+	// In HID, `wIndex` is interface number.
 	uint16_t wIndex = packet->wIndex;
 
 	for (int i = 0; i < N_INTERFACES; ++i) {
@@ -484,14 +575,14 @@ void usb_handle_setup_request(struct usb_device *device)
 			}
 		} else if (request == USB_REQUEST_GET_STATUS) {
 			// I try to dump debug stream from Linux kernel, it
-			// seems you need to answer to a `GET_STATUS` request
-			// after resume, otherwise it will return a IO error
+			// seems you need to answer a `GET_STATUS` request after
+			// resume, otherwise Linux kernel will return a IO error
 			// and disconnect/reconnect the device.
 			usb_get_status(device, packet);
 		}
 	}
 
-	// After DATA stage, the last one is STATUS stage, we need to send
+	// After DATA stage, the last one is STATUS stage, we need to transfer a
 	// zero-length DATA1 packet from the other direction.
 	if (direction == USB_DIRECTION_OUT) {
 		device->ep0_in->next_pid = 1;
@@ -565,7 +656,7 @@ void usb_init_endpoint(struct usb_endpoint *endpoint)
 		       (endpoint->descriptor->bmAttributes
 			<< EP_CTRL_BUFFER_TYPE_LSB) |
 		       dpram_offset;
-	*(endpoint->endpoint_control) = reg;
+	*endpoint->endpoint_control = reg;
 }
 
 void usb_init_interface(struct usb_interface *interface)
@@ -622,8 +713,7 @@ void usb_init(struct usb_device *device)
 }
 
 void ep0_in_on_complete(struct usb_endpoint *endpoint,
-			struct usb_device *device, uint8_t *buffer,
-			uint16_t length)
+			struct usb_device *device)
 {
 	// Set address when we finished the STATUS stage from address 0.
 	if (device->should_set_address) {
@@ -633,14 +723,12 @@ void ep0_in_on_complete(struct usb_endpoint *endpoint,
 }
 
 void ep0_out_on_complete(struct usb_endpoint *endpoint,
-			 struct usb_device *device, uint8_t *buffer,
-			 uint16_t length)
+			 struct usb_device *device)
 {
 }
 
 void ep1_in_on_complete(struct usb_endpoint *endpoint,
-			struct usb_device *device, uint8_t *buffer,
-			uint16_t length)
+			struct usb_device *device)
 {
 }
 
@@ -694,7 +782,7 @@ void button_on_events(uint gpio, uint32_t events)
 		this->last_button_time = get_boot_ms();
 
 		// Pico triggers GPIO events as a timer! So I need to manually
-		// skip repeated events.
+		// ignore repeated events.
 		if (events != this->last_button_events) {
 			this->last_button_events = events;
 
@@ -736,7 +824,12 @@ int main(void)
 				       .endpoint_control = NULL,
 				       .buffer_control =
 					       &usb_dpram->ep_buf_ctrl[0].in,
-				       .data_buffer = usb_dpram->ep0_buf_a };
+				       .data_buffer = usb_dpram->ep0_buf_a,
+				       .user_buffer = NULL,
+				       .user_buffer_length = 0,
+				       .transferred_length = 0,
+				       .busy = false,
+				       .next_pid = 0 };
 	struct usb_endpoint_descriptor ep0_out_descriptor = {
 		.bLength = sizeof(ep0_out_descriptor),
 		.bDescriptorType = USB_DESCRIPTOR_TYPE_ENDPOINT,
@@ -751,7 +844,12 @@ int main(void)
 					.endpoint_control = NULL,
 					.buffer_control =
 						&usb_dpram->ep_buf_ctrl[0].out,
-					.data_buffer = usb_dpram->ep0_buf_b };
+					.data_buffer = usb_dpram->ep0_buf_b,
+					.user_buffer = NULL,
+					.user_buffer_length = 0,
+					.transferred_length = 0,
+					.busy = false,
+					.next_pid = 0 };
 	struct usb_endpoint_descriptor ep1_in_descriptor = {
 		.bLength = sizeof(ep1_in_descriptor),
 		.bDescriptorType = USB_DESCRIPTOR_TYPE_ENDPOINT,
@@ -773,7 +871,12 @@ int main(void)
 		.buffer_control = &usb_dpram->ep_buf_ctrl[1].in,
 		// First free EPX buffer.
 		// If I change `wMaxPacketSize`, should I also change this?
-		.data_buffer = &usb_dpram->epx_data[0 * PACKET_SIZE]
+		.data_buffer = &usb_dpram->epx_data[0 * PACKET_SIZE],
+		.user_buffer = NULL,
+		.user_buffer_length = 0,
+		.transferred_length = 0,
+		.busy = false,
+		.next_pid = 0
 	};
 	// The specification is available here:
 	// <https://www.usb.org/sites/default/files/hid1_11.pdf>

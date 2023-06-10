@@ -20,18 +20,22 @@ struct usb_interface;
 struct usb_device;
 
 typedef void (*usb_endpoint_complete_callback)(struct usb_endpoint *endpoint,
-					       struct usb_device *device,
-					       uint8_t *buf, uint16_t len);
+					       struct usb_device *device);
 
 // Struct in which we keep the endpoint data.
 struct usb_endpoint {
 	const struct usb_endpoint_descriptor *descriptor;
 	usb_endpoint_complete_callback on_complete;
 
-	// Pointers to endpoint + buffer control registers in the USB DPSRAM.
+	// Pointers to endpoint and buffer control registers in the USB DPSRAM.
 	volatile uint32_t *endpoint_control;
 	volatile uint32_t *buffer_control;
 	volatile uint8_t *data_buffer;
+
+	uint8_t *user_buffer;
+	uint32_t user_buffer_length;
+	uint32_t transferred_length;
+	bool busy;
 
 	// Toggle after each packet (unless replying to a SETUP).
 	uint8_t next_pid;
