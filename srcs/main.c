@@ -21,10 +21,12 @@
 #define EP0_OUT_ADDRESS (USB_DIRECTION_OUT | 0)
 #define EP1_IN_ADDRESS (USB_DIRECTION_IN | 1)
 
-// Because now I implemented multi-packet transfer, it should be OK to change
-// this to a smaller size, but if this is too small, it might be too slow to
-// reply setup (too much data to send and transfer is blocked), so just use
-// 32 or 64.
+// With multi-packet transfer, it should be OK to use a smaller packet size,
+// but if you are using a value which is less than 32, your host may unable to
+// setup this device. This is because we simply refuse to transfer new data if
+// endpoint is busy, and when connecting a device to a host, there are many
+// setup requests to reply so one may block another, you may need to manually
+// maintain a data queue if you use a packet size which is too small.
 #define PACKET_SIZE 64
 
 #define usb_hw_set hw_set_alias(usb_hw)
@@ -81,7 +83,7 @@ void led_init(void)
 	led_off();
 }
 
-// When plugging/unplugging device, the D+/D- state are unstable and may
+// When plugging/unplugging device, the D+/D- states are unstable and may
 // accidentally trigger suspend or resume (don't ask me why I am not a circuit
 // engineer), so we just skip those before we are properly configured.
 
