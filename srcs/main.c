@@ -305,6 +305,70 @@ int usb_endpoint_start_transfer(struct usb_endpoint *endpoint, uint8_t *buffer,
 	return 0;
 }
 
+static inline struct usb_endpoint *
+usb_get_endpoint_by_address(struct usb_device *device, uint8_t address)
+{
+	if (device->ep0_in->descriptor->bEndpointAddress == address)
+		return device->ep0_in;
+	if (device->ep0_out->descriptor->bEndpointAddress == address)
+		return device->ep0_out;
+
+	for (int i = 0; i < N_INTERFACES; ++i) {
+		struct usb_interface *interface = device->interfaces[i];
+		for (int j = 0; j < interface->n_endpoints; ++j) {
+			struct usb_endpoint *endpoint = interface->endpoints[j];
+			if (endpoint->descriptor->bEndpointAddress == address) {
+				return endpoint;
+			}
+		}
+	}
+
+	return NULL;
+}
+
+void usb_endpoint_set_halt(struct usb_endpoint *endpoint)
+{
+	if (endpoint->halt)
+		return;
+
+	uint32_t buffer_control = *endpoint->buffer_control;
+
+	endpoint->halt = true;
+
+	// See 4.1.2.6.1. SETUP in <https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf>.
+	//
+	// For EP0 we need one more step.
+	if (endpoint->descriptor->bEndpointAddress == EP0_IN_ADDRESS)
+		usb_hw_set->ep_stall_arm = USB_EP_STALL_ARM_EP0_IN_BITS;
+	if (endpoint->descriptor->bEndpointAddress == EP0_OUT_ADDRESS)
+		usb_hw_set->ep_stall_arm = USB_EP_STALL_ARM_EP0_OUT_BITS;
+
+	*endpoint->buffer_control = buffer_control & USB_BUF_CTRL_STALL;
+}
+
+void usb_endpoint_clear_halt(struct usb_endpoint *endpoint)
+{
+	if (!endpoint->halt)
+		return;
+
+	uint32_t buffer_control = *endpoint->buffer_control;
+
+	endpoint->halt = false;
+
+	// See 4.1.2.6.1. SETUP in <https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf>.
+	//
+	// Setup packets already clear STALL and we already set PID for setup
+	// requests, so when we receive `ClearFeature(ENDPOINT_HALT)`, EP0 is
+	// already cleared.
+	if (endpoint->descriptor->bEndpointAddress == EP0_IN_ADDRESS ||
+	    endpoint->descriptor->bEndpointAddress == EP0_OUT_ADDRESS)
+		return;
+
+	// Clearing STALL also reset PID to DATA0.
+	endpoint->next_pid = 0;
+	*endpoint->buffer_control = buffer_control & ~USB_BUF_CTRL_STALL;
+}
+
 void usb_set_address(struct usb_device *device,
 		     volatile struct usb_setup_packet *packet)
 {
@@ -338,9 +402,11 @@ void usb_set_feature(struct usb_device *device,
 		}
 	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
 		if (wValue == USB_FEATURE_ENDPOINT_HALT) {
-			// Not implemented.
-			// TODO: First implement STALL/NAK, which should be done
-			// by writing registers to controll the USB controller.
+			struct usb_endpoint *endpoint =
+				usb_get_endpoint_by_address(device, wIndex);
+			if (endpoint != NULL) {
+				usb_endpoint_set_halt(endpoint);
+			}
 		}
 	}
 }
@@ -359,9 +425,11 @@ void usb_clear_feature(struct usb_device *device,
 		}
 	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
 		if (wValue == USB_FEATURE_ENDPOINT_HALT) {
-			// Not implemented.
-			// TODO: First implement STALL/NAK, which should be done
-			// by writing registers to controll the USB controller.
+			struct usb_endpoint *endpoint =
+				usb_get_endpoint_by_address(device, wIndex);
+			if (endpoint != NULL) {
+				usb_endpoint_clear_halt(endpoint);
+			}
 		}
 	}
 }
@@ -482,9 +550,7 @@ void usb_get_status(struct usb_device *device,
 {
 	uint8_t recipient = packet->bmRequestType &
 			    USB_REQUEST_TYPE_RECIPIENT_MASK;
-	// If you need the actual interface/endpoint number, read the `wIndex`
-	// field, I just don't need it here.
-	//
+	uint16_t wIndex = packet->wIndex;
 	// The `wLength` should always be 2, if not, stop buying devices from
 	// that vendor.
 	if (recipient == USB_REQUEST_TYPE_RECIPIENT_DEVICE) {
@@ -505,11 +571,15 @@ void usb_get_status(struct usb_device *device,
 					    MIN(sizeof(status),
 						packet->wLength));
 	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
-		// We just never halt.
-		uint8_t status[2] = { 0x00, 0x00 };
-		usb_endpoint_start_transfer(device->ep0_in, status,
-					    MIN(sizeof(status),
-						packet->wLength));
+		struct usb_endpoint *endpoint =
+			usb_get_endpoint_by_address(device, wIndex);
+		if (endpoint != NULL) {
+			uint8_t status[2] = { 0x00,
+					      endpoint->halt ? 0x01 : 0x00 };
+			usb_endpoint_start_transfer(device->ep0_in, status,
+						    MIN(sizeof(status),
+							packet->wLength));
+		}
 	} else {
 		// Why are you falling here? When I write this program those
 		// values are reserved, are you still a human?
@@ -829,6 +899,7 @@ int main(void)
 				       .user_buffer_length = 0,
 				       .transferred_length = 0,
 				       .busy = false,
+				       .halt = false,
 				       .next_pid = 0 };
 	struct usb_endpoint_descriptor ep0_out_descriptor = {
 		.bLength = sizeof(ep0_out_descriptor),
@@ -849,6 +920,7 @@ int main(void)
 					.user_buffer_length = 0,
 					.transferred_length = 0,
 					.busy = false,
+					.halt = false,
 					.next_pid = 0 };
 	struct usb_endpoint_descriptor ep1_in_descriptor = {
 		.bLength = sizeof(ep1_in_descriptor),
@@ -876,6 +948,7 @@ int main(void)
 		.user_buffer_length = 0,
 		.transferred_length = 0,
 		.busy = false,
+		.halt = false,
 		.next_pid = 0
 	};
 	// The specification is available here:

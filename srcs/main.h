@@ -37,6 +37,7 @@ struct usb_endpoint {
 	uint32_t transferred_length;
 	bool busy;
 
+	bool halt;
 	// Toggle after each packet (unless replying to a SETUP).
 	uint8_t next_pid;
 };
