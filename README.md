@@ -16,6 +16,16 @@ $ PICO_SDK_PATH=/WHERE/YOU/CLONE/PICO/SDK cmake ..
 $ PICO_SDK_PATH=/WHERE/YOU/CLONE/PICO/SDK make
 ```
 
+If you are not using the original Pico from Raspberry Pi, you may need to define your board model, for example, I am using a WaveShare RP2040-Zero, then I use the following CMake command:
+
+```
+$ PICO_SDK_PATH=/WHERE/YOU/CLONE/PICO/SDK cmake -DPICO_BOARD=waveshare_rp2040_zero ..
+```
+
+List of board models could be find in [this directory of pico-sdk](https://github.com/raspberrypi/pico-sdk/tree/master/src/boards/include/boards).
+
+**NOTE**: If you happen to have the same WaveShare RP2040-Zero board as mine, you may got [this bug](https://github.com/raspberrypi/pico-sdk/issues/1304) which prevents it from working after unplug and replug the USB cable, I already submit [a PR to fix the bug](https://github.com/raspberrypi/pico-sdk/pull/1421).
+
 Take out your pico, connect a LED to GPIO 1 and GND with a resistor, and connect a button to GPIO 2 and 3.3V, then press and hold BOOTSEL button on your pico and connect it with you computer, mount it to somewhere.
 
 ```
