@@ -778,10 +778,10 @@ void usb_init(struct usb_device *device)
 	// Present full speed device by enabling pull up on DP.
 	usb_hw_set->sie_ctrl = USB_SIE_CTRL_PULLUP_EN_BITS;
 
-	// Enable USB interrupt at processor.
-	irq_set_enabled(USBCTRL_IRQ, true);
 	// Set interrupt handler for USB.
 	irq_set_exclusive_handler(USBCTRL_IRQ, usb_on_events);
+	// Enable USB interrupt at processor.
+	irq_set_enabled(USBCTRL_IRQ, true);
 }
 
 void ep0_in_on_complete(struct usb_endpoint *endpoint,
@@ -842,41 +842,58 @@ void button_release(struct usb_device *device)
 				    sizeof(buffer));
 }
 
-void button_on_events(uint gpio, uint32_t events)
+void button_handle_events(uint32_t events)
 {
 	struct usb_device *device = this->device;
 
 	// It looks like Pico has Schmitt triggers and by default enabling it,
 	// so maybe this software debouncing is not needed, but keeping it is
 	// harmless.
-	if (get_boot_ms() - this->last_button_time > DEBOUNCE_TIME) {
-		// Recommend to keep the position of this line to be precise.
-		this->last_button_time = get_boot_ms();
+	if (get_boot_ms() - this->last_button_time <= DEBOUNCE_TIME)
+		return;
+	// Recommend to keep the position of this line to be precise.
+	this->last_button_time = get_boot_ms();
 
-		// Pico triggers GPIO events as a timer! So I need to manually
-		// ignore repeated events.
-		if (events != this->last_button_events) {
-			this->last_button_events = events;
+	// According to the SDK doc, HIGH/LOW is triggered continuously,
+	// so I need to manually ignore repeated events.
+	if (events == this->last_button_events)
+		return;
+	this->last_button_events = events;
 
-			// Because this is a HID keyboard, if it is suspended,
-			// it requires a remote wakeup on button events.
-			if (device->suspended)
-				usb_remote_wakeup(device);
+	// Because this is a HID keyboard, if it is suspended,
+	// it requires a remote wakeup on button events.
+	if (device->suspended)
+		usb_remote_wakeup(device);
 
-			if (events & GPIO_IRQ_LEVEL_HIGH)
-				button_press(device);
-			else if (events & GPIO_IRQ_LEVEL_LOW)
-				button_release(device);
-		}
+	if (events & GPIO_IRQ_LEVEL_HIGH)
+		button_press(device);
+	else if (events & GPIO_IRQ_LEVEL_LOW)
+		button_release(device);
+}
+
+void gpio_on_events(uint gpio, uint32_t events)
+{
+	// First check whether this event is triggered by the pin we want. This
+	// should be checked first, because we need to debounce each pins and
+	// check states of each pins independently.
+	switch (gpio) {
+	case BUTTON_PIN:
+		button_handle_events(events);
+		break;
+	default:
+		break;
 	}
 }
 
 void button_init(void)
 {
+	gpio_init(BUTTON_PIN);
+	gpio_set_dir(BUTTON_PIN, GPIO_IN);
 	gpio_pull_down(BUTTON_PIN);
-	gpio_set_irq_enabled_with_callback(
-		BUTTON_PIN, GPIO_IRQ_LEVEL_HIGH | GPIO_IRQ_LEVEL_LOW, true,
-		&button_on_events);
+	gpio_set_irq_enabled(BUTTON_PIN,
+			     GPIO_IRQ_LEVEL_HIGH | GPIO_IRQ_LEVEL_LOW, true);
+	gpio_set_irq_callback(gpio_on_events);
+	irq_set_enabled(IO_IRQ_BANK0, true);
 }
 
 int main(void)
