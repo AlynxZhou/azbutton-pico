@@ -12,14 +12,14 @@ Before building this project, you need to prepare [pico-sdk](https://github.com/
 $ git clone https://github.com/AlynxZhou/azbutton-pico.git
 $ cd azbutton-pico
 $ mkdir build && cd build
-$ PICO_SDK_PATH=/WHERE/YOU/CLONE/PICO/SDK cmake ..
+$ PICO_SDK_PATH=/WHERE/YOU/CLONE/PICO/SDK cmake -DUSB_SERIAL=CHANGETHISEACHBOARD ..
 $ PICO_SDK_PATH=/WHERE/YOU/CLONE/PICO/SDK make
 ```
 
 If you are not using the original Pico from Raspberry Pi, you may need to define your board model, for example, I am using a WaveShare RP2040-Zero, then I use the following CMake command:
 
 ```
-$ PICO_SDK_PATH=/WHERE/YOU/CLONE/PICO/SDK cmake -DPICO_BOARD=waveshare_rp2040_zero ..
+$ PICO_SDK_PATH=/WHERE/YOU/CLONE/PICO/SDK cmake -DPICO_BOARD=waveshare_rp2040_zero -DUSB_SERIAL=CHANGETHISEACHBOARD ..
 ```
 
 List of board models could be find in [this directory of pico-sdk](https://github.com/raspberrypi/pico-sdk/tree/master/src/boards/include/boards).
@@ -49,3 +49,7 @@ Search and change the value of `BUTTON_PIN` and `LED_PIN`.
 ## USB Vendor/Product ID and String
 
 IDs are defined in device descriptor, and strings are defined in `descriptor_strings`.
+
+## USB Serial
+
+You should use different USB serial for different boards, otherwise your system may treat them as the same one, you could set USB serial by changing `-DUSB_SERIAL=CHANGETHISEACHBOARD` argument of CMake.

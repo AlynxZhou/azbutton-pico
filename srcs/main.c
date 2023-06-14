@@ -15,6 +15,12 @@
 // For time related functions from pico-sdk.
 #include "pico/stdlib.h"
 
+#include "config.h"
+
+#ifndef USB_SERIAL
+#	define USB_SERIAL "Strelizia"
+#endif
+
 #include "main.h"
 
 #define EP0_IN_ADDRESS (USB_DIRECTION_IN | 0)
@@ -1154,10 +1160,10 @@ int main(void)
 			"AZButton Pico",
 			// Serial Number.
 			// Actually it is a string, so just put anything I want.
-			// You'd better change this if you are flashing
+			// You'd better change serial if you are flashing
 			// different chips, otherwise they are the same to one
 			// host.
-			"Strelizia"
+			USB_SERIAL
 		},
 		.ep0_in = &ep0_in,
 		.ep0_out = &ep0_out,
