@@ -6,7 +6,7 @@ A pico-based, single-button USB HID keyboard firmware.
 
 # Usage
 
-Before building this project, you need to prepare [pico-sdk](https://github.com/raspberrypi/pico-sdk/). You may need the `develop` branch if you are using GCC 13. And [this article](https://wellys.com/posts/rp2040_c_linux/) could be a good tutorial about how to setup it on Linux.
+Before building this project, you need to prepare [pico-sdk](https://github.com/raspberrypi/pico-sdk/). You may need the `develop` branch if you are using a very new GCC. And [this article](https://wellys.com/posts/rp2040_c_linux/) could be a good tutorial about how to setup it on Linux. On macOS, you need to install `gcc-arm-embedded` for cross compiling.
 
 ```
 $ git clone https://github.com/AlynxZhou/azbutton-pico.git
@@ -32,15 +32,15 @@ Take out your pico, connect a LED to GPIO 1 and GND with a resistor, and connect
 $ cp lib/azbutton-pico.uf2 /WHERE/YOU/MOUNT/PICO
 ```
 
-It should re-connect to your computer, then you'll see it as a USB HID keyboard, press the button will send Enter.
+It should re-connect to your computer, then you'll see it as a USB HID keyboard, press the button will send F23.
 
 # Modification
 
 ## Scancode
 
-Search the code for `HID_KEYBOARD_SCANCODE_ENTER`, and replace them with other scancodes you define.
+Search the code for `HID_KEYBOARD_SCANCODE_KEY`, and replace them with other scancodes you define.
 
-NOTE: If you want to use it as a modifier key (Ctrl, Alt or others), it's not the same, because HID uses different bytes for normal key and modifier key. You could edit `button_press()` and `button_release()` to cancel the normal key and change the modifier key, but I suggest to keep using Enter on it, and remap scancode on your system, for example, [use udev rules to remap keys](https://wiki.archlinux.org/title/Map_scancodes_to_keycodes#Using_udev).
+NOTE: If you want to use it as a modifier key (Ctrl, Alt, Shift or GUI), it's not the same, because HID uses different bytes for normal key and modifier key. You could edit `button_press()` and `button_release()` to empty the normal key array and change the modifier key byte, but I suggest to keep using Compose (Application) key in code, and remap it on your system, for example, [use udev rules to remap keys](https://wiki.archlinux.org/title/Map_scancodes_to_keycodes#Using_udev). Some keys won't work on macOS, for example F21~F23.
 
 ## GPIO PIN
 

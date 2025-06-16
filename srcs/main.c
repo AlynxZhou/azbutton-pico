@@ -38,8 +38,8 @@
 #define usb_hw_set hw_set_alias(usb_hw)
 #define usb_hw_clear hw_clear_alias(usb_hw)
 
-// `0x65` is Application, typically AT-101 Keyboard ends here.
-#define HID_KEYBOARD_KEYS 0x66
+// Typically AT-101 Keyboard ends at `0x65`, but we support more unused keys.
+#define HID_KEYBOARD_KEYS 0xfc
 
 #define HID_KEYBOARD_MODIFIER_NONE 0x00
 
@@ -56,6 +56,12 @@
 #define HID_KEYBOARD_ERROR_ROLL_OVER 0x01
 
 #define HID_KEYBOARD_SCANCODE_ENTER 0x28
+#define HID_KEYBOARD_SCANCODE_CAPSLOCK 0x39
+#define HID_KEYBOARD_SCANCODE_COMPOSE 0x65
+#define HID_KEYBOARD_SCANCODE_F13 0x68
+#define HID_KEYBOARD_SCANCODE_F23 0x72
+#define HID_KEYBOARD_SCANCODE_COFFEE 0xf9
+#define HID_KEYBOARD_SCANCODE_KEY HID_KEYBOARD_SCANCODE_COMPOSE
 
 #define BUTTON_PIN 2
 #define LED_PIN 1
@@ -824,7 +830,7 @@ void button_press(struct usb_device *device)
 	memset(&buffer[HID_KEYBOARD_INDEX_KEYS], 0, HID_KEYBOARD_MAX_KEYS);
 
 	// If you want other keys, modify here.
-	buffer[HID_KEYBOARD_INDEX_KEYS] = HID_KEYBOARD_SCANCODE_ENTER;
+	buffer[HID_KEYBOARD_INDEX_KEYS] = HID_KEYBOARD_SCANCODE_KEY;
 
 	// We already know which endpoint is for keyboard.
 	usb_endpoint_start_transfer(device->interfaces[0]->endpoints[0], buffer,
@@ -1025,6 +1031,11 @@ int main(void)
 		// Input (Constant): Reserved byte
 		0x81, 0x01,
 
+		// We don't accept LED status output from host, so don't report
+		// LED status in descriptor. Linux won't mind this but macOS
+		// will be confused if you report you have LEDs but never handle
+		// host output.
+		/*
 		// Usage Page (LEDs)
 		0x05, 0x08,
 		// Usage Minimum (1)
@@ -1044,16 +1055,17 @@ int main(void)
 		0x95, 0x01,
 		// Output (Constant): LED report padding
 		0x91, 0x01,
+		*/
 
 		// Usage Page (Key Codes)
 		0x05, 0x07,
 		// Usage Minimum (0)
 		0x19, 0x00,
-		// Usage Maximum (101)
+		// Usage Maximum (251)
 		0x29, HID_KEYBOARD_KEYS - 1,
 		// Logical Minimum (0)
 		0x15, 0x00,
-		// Logical Maximum(101)
+		// Logical Maximum(251)
 		0x25, HID_KEYBOARD_KEYS - 1,
 		// Report Size (8)
 		0x75, 0x08,
