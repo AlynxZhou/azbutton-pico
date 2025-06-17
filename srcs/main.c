@@ -41,8 +41,6 @@
 // Typically AT-101 Keyboard ends at `0x65`, but we support more unused keys.
 #define HID_KEYBOARD_KEYS 0xfc
 
-#define HID_KEYBOARD_MODIFIER_NONE 0x00
-
 #define HID_KEYBOARD_INDEX_MODIFIER 0
 #define HID_KEYBOARD_INDEX_KEYS 2
 
@@ -51,6 +49,16 @@
 // descriptor.
 #define HID_KEYBOARD_MAX_KEYS 6
 #define HID_KEYBOARD_EVENT_SIZE (2 + HID_KEYBOARD_MAX_KEYS)
+
+#define HID_KEYBOARD_MODIFIER_NONE 0x00
+#define HID_KEYBOARD_MODIFIER_LEFT_CONTROL (1 << 0)
+#define HID_KEYBOARD_MODIFIER_LEFT_SHIFT (1 << 1)
+#define HID_KEYBOARD_MODIFIER_LEFT_ALT (1 << 2)
+#define HID_KEYBOARD_MODIFIER_LEFT_GUI (1 << 3)
+#define HID_KEYBOARD_MODIFIER_RIGHT_CONTROL (1 << 4)
+#define HID_KEYBOARD_MODIFIER_RIGHT_SHIFT (1 << 5)
+#define HID_KEYBOARD_MODIFIER_RIGHT_ALT (1 << 6)
+#define HID_KEYBOARD_MODIFIER_RIGHT_GUI (1 << 7)
 
 #define HID_KEYBOARD_RESERVED 0x00
 #define HID_KEYBOARD_ERROR_ROLL_OVER 0x01
@@ -178,12 +186,11 @@ void usb_endpoint_handle_packet_next(struct usb_endpoint *endpoint)
 	uint32_t value = length | USB_BUF_CTRL_AVAIL;
 
 	if (usb_endpoint_is_in(endpoint)) {
-		if (endpoint->user_buffer != NULL) {
+		if (endpoint->user_buffer != NULL)
 			memcpy((void *)endpoint->data_buffer,
 			       endpoint->user_buffer +
 				       endpoint->transferred_length,
 			       length);
-		}
 		value |= USB_BUF_CTRL_FULL;
 	}
 
@@ -278,10 +285,9 @@ void usb_handle_buffer_status(struct usb_device *device)
 		for (int j = 0; j < interface->n_endpoints; ++j) {
 			struct usb_endpoint *endpoint = interface->endpoints[j];
 			if (buffers &
-			    (1 << usb_endpoint_address_to_bit(endpoint))) {
+			    (1 << usb_endpoint_address_to_bit(endpoint)))
 				usb_endpoint_handle_packet_done(endpoint,
 								device);
-			}
 		}
 	}
 }
@@ -331,9 +337,8 @@ usb_get_endpoint_by_address(struct usb_device *device, uint8_t address)
 		struct usb_interface *interface = device->interfaces[i];
 		for (int j = 0; j < interface->n_endpoints; ++j) {
 			struct usb_endpoint *endpoint = interface->endpoints[j];
-			if (endpoint->descriptor->bEndpointAddress == address) {
+			if (endpoint->descriptor->bEndpointAddress == address)
 				return endpoint;
-			}
 		}
 	}
 
@@ -408,19 +413,17 @@ void usb_set_feature(struct usb_device *device,
 	uint16_t wValue = packet->wValue;
 	uint16_t wIndex = packet->wIndex;
 	if (recipient == USB_REQUEST_TYPE_RECIPIENT_DEVICE) {
-		// This is the only device feature that can be clear.
-		if (wValue == USB_FEATURE_DEVICE_REMOTE_WAKEUP) {
+		// This is the only device feature that can be set.
+		if (wValue == USB_FEATURE_DEVICE_REMOTE_WAKEUP)
 			device->could_remote_wakeup = true;
-		} else if (wValue == USB_FEATURE_TEST_MODE) {
-			// Too complicated, I just don't implement it.
-		}
+		// Too complicated, I just don't implement it.
+		// else if (wValue == USB_FEATURE_TEST_MODE)
 	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
 		if (wValue == USB_FEATURE_ENDPOINT_HALT) {
 			struct usb_endpoint *endpoint =
 				usb_get_endpoint_by_address(device, wIndex);
-			if (endpoint != NULL) {
+			if (endpoint != NULL)
 				usb_endpoint_set_halt(endpoint);
-			}
 		}
 	}
 }
@@ -434,16 +437,14 @@ void usb_clear_feature(struct usb_device *device,
 	uint16_t wIndex = packet->wIndex;
 	if (recipient == USB_REQUEST_TYPE_RECIPIENT_DEVICE) {
 		// This is the only device feature that can be clear.
-		if (wValue == USB_FEATURE_DEVICE_REMOTE_WAKEUP) {
+		if (wValue == USB_FEATURE_DEVICE_REMOTE_WAKEUP)
 			device->could_remote_wakeup = false;
-		}
 	} else if (recipient == USB_REQUEST_TYPE_RECIPIENT_ENDPOINT) {
 		if (wValue == USB_FEATURE_ENDPOINT_HALT) {
 			struct usb_endpoint *endpoint =
 				usb_get_endpoint_by_address(device, wIndex);
-			if (endpoint != NULL) {
+			if (endpoint != NULL)
 				usb_endpoint_clear_halt(endpoint);
-			}
 		}
 	}
 }
@@ -595,8 +596,7 @@ void usb_get_status(struct usb_device *device,
 							packet->wLength));
 		}
 	} else {
-		// Why are you falling here? When I write this program those
-		// values are reserved, are you still a human?
+		// Reserved value, no one should reach here.
 	}
 }
 
